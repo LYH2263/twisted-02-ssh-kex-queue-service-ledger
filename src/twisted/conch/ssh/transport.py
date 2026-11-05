@@ -38,7 +38,7 @@ except ImportError:
     mlkem = None  # type: ignore[assignment]
 
 from twisted import __version__ as twisted_version
-from twisted.conch.ssh import _kex, address, keys
+from twisted.conch.ssh import _kex, _service_ledger, address, keys
 from twisted.conch.ssh.common import MP, NS, ffs, getMP, getNS
 from twisted.conch.ssh.service import SSHService
 from twisted.internet import defer, protocol
@@ -520,9 +520,29 @@ class SSHTransportBase(protocol.Protocol):
     _peerSupportsExtensions = False
     peerExtensions: dict[bytes, bytes] = {}
 
+    # An optional L{twisted.conch.ssh._service_ledger.ServiceLedger}
+    # recording the settlements (key-exchange queue flush/void, connection
+    # loss, service switches) committed on this transport.  When C{None},
+    # every exit keeps its historical, unguarded behavior.
+    serviceLedger: _service_ledger.ServiceLedger | None = None
+
     # Set by twisted.conch.ssh.userauth.SSHUserAuthServer._cbFinishedAuth
     avatar: object
     logoutFunction: Callable[[], None]
+
+    def enableServiceLedger(self) -> _service_ledger.ServiceLedger:
+        """
+        Install and return the host-facing settlement ledger on this
+        transport.
+
+        The ledger is opt-in: transports on which this is never called keep
+        all of their existing behavior.  No new constructor parameter is
+        involved, and the same ledger is shared with whichever services run
+        on the transport.
+        """
+        if self.serviceLedger is None:
+            self.serviceLedger = _service_ledger.ServiceLedger()
+        return self.serviceLedger
 
     def connectionLost(self, reason: Failure | None = None) -> None:
         """
@@ -532,6 +552,19 @@ class SSHTransportBase(protocol.Protocol):
         @type reason: L{twisted.python.failure.Failure}
         @param reason: The cause of the connection being closed.
         """
+        if self.serviceLedger is not None:
+            # Full connection loss is its own settlement: void any blocked
+            # key-exchange queue, and stop the service (and log out the
+            # avatar) exactly once.  A nested loss triggered from inside the
+            # service's serviceStopped must not settle them a second time.
+            if self.serviceLedger.transportConnectionLostBegan(self, reason):
+                if self.service:
+                    self.service.serviceStopped()
+                if hasattr(self, "avatar"):
+                    self.logoutFunction()
+                    self.serviceLedger.transportAvatarLoggedOut()
+            self._log.info("connection lost")
+            return
         if self.service:
             self.service.serviceStopped()
         if hasattr(self, "avatar"):
@@ -597,6 +630,8 @@ class SSHTransportBase(protocol.Protocol):
         self.sendPacket(MSG_KEXINIT, self.ourKexInitPayload[1:])
         self._keyExchangeState = self._KEY_EXCHANGE_REQUESTED
         self._blockedByKeyExchange = []
+        if self.serviceLedger is not None:
+            self.serviceLedger.keyExchangeRoundBegan(self)
 
     def _allowedKeyExchangeMessageType(self, messageType):
         """
@@ -638,6 +673,17 @@ class SSHTransportBase(protocol.Protocol):
         """
         if self._keyExchangeState != self._KEY_EXCHANGE_NONE:
             if not self._allowedKeyExchangeMessageType(messageType):
+                if self._blockedByKeyExchange is None:
+                    # The queue for this exchange was already settled (voided
+                    # because the connection is closing).  An inner sender
+                    # must not recreate the queue or sneak its packet into a
+                    # flush that will never happen; the packet is refused
+                    # every exit.
+                    if self.serviceLedger is not None:
+                        self.serviceLedger.keyExchangeMessageRefused(
+                            self, messageType, payload
+                        )
+                    return
                 self._blockedByKeyExchange.append((messageType, payload))
                 return
 
@@ -1070,8 +1116,14 @@ class SSHTransportBase(protocol.Protocol):
         @param service: The service to attach.
         """
         self._log.debug("starting service {service!r}", service=service.name)
-        if self.service:
-            self.service.serviceStopped()
+        oldService = self.service
+        if self.serviceLedger is not None:
+            # A service switch is a different settlement boundary from a
+            # full connection loss: the old service is stopped and the new
+            # one started, but no avatar logout belongs to this exit.
+            self.serviceLedger.transportServiceSwitched(self, oldService, service)
+        if oldService:
+            oldService.serviceStopped()
         self.service = service
         service.transport = self
         self.service.serviceStarted()
@@ -1121,6 +1173,11 @@ class SSHTransportBase(protocol.Protocol):
         @param desc: a descrption of the reason for the disconnection.
         @type desc: L{str}
         """
+        if self.serviceLedger is not None:
+            # The disconnect exit wins over any later NEWKEYS: the blocked
+            # queue is voided and detached, so its entries can never be
+            # replayed onto a closing connection.
+            self.serviceLedger.voidKeyExchangeQueue(self)
         self.sendPacket(MSG_DISCONNECT, struct.pack(">L", reason) + NS(desc) + NS(b""))
         self._log.info(
             "Disconnecting with error, code {code}\nreason: {description}",
@@ -1248,10 +1305,17 @@ class SSHTransportBase(protocol.Protocol):
             self.incomingCompression = zlib.decompressobj()
 
         self._keyExchangeState = self._KEY_EXCHANGE_NONE
-        messages = self._blockedByKeyExchange
-        self._blockedByKeyExchange = None
-        for messageType, payload in messages:
-            self.sendPacket(messageType, payload)
+        if self.serviceLedger is not None:
+            # The ledger snapshots the queue before resending so entries an
+            # inner sender appends to the old queue object cannot ride this
+            # flush, and so a round already voided by a disconnect is never
+            # replayed.
+            self.serviceLedger.flushKeyExchangeQueue(self)
+        else:
+            messages = self._blockedByKeyExchange
+            self._blockedByKeyExchange = None
+            for messageType, payload in messages:
+                self.sendPacket(messageType, payload)
 
     def isEncrypted(self, direction="out"):
         """

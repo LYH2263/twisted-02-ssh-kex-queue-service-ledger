@@ -20,6 +20,16 @@ from twisted.logger import Logger
 from twisted.python.compat import nativeString, networkString
 
 
+def _serviceLedgerOf(connectionService):
+    """
+    @return: The L{ServiceLedger} installed on the transport of
+        C{connectionService}, or L{None} when settlement bookkeeping was not
+        enabled.
+    """
+    transport = getattr(connectionService, "transport", None)
+    return getattr(transport, "serviceLedger", None)
+
+
 class SSHConnection(service.SSHService):
     """
     An implementation of the 'ssh-connection' service.  It is used to
@@ -66,15 +76,34 @@ class SSHConnection(service.SSHService):
         """
         Called when the connection is stopped.
         """
+        ledger = _serviceLedgerOf(self)
+        if (
+            ledger is not None
+            # The stop is committed once: work nested inside the terminal
+            # callbacks below (a new openChannel, a new global request, a
+            # repeated serviceStopped) sees the committed stop and cannot
+            # escape it with a different failure form.
+            and not ledger.connectionServiceCanStop(self)
+        ):
+            return
         # Close any fully open channels
         for channel in list(self.channelsToRemoteChannel.keys()):
+            if ledger is not None:
+                ledger.channelSettledClosed(
+                    self, channel, list(self.deferreds.get(channel.id, []))
+                )
             self.channelClosed(channel)
         # Indicate failure to any channels that were in the process of
         # opening but not yet open.
         while self.channels:
             (_, channel) = self.channels.popitem()
-            channel.openFailed(twisted.internet.error.ConnectionLost())
+            reason = twisted.internet.error.ConnectionLost()
+            if ledger is not None:
+                ledger.channelSettledOpenFailed(self, channel, reason)
+            channel.openFailed(reason)
         # Errback any unfinished global requests.
+        if ledger is not None:
+            ledger.globalRequestsSettled(self, list(self.deferreds["global"]))
         self._cleanupGlobalDeferreds()
 
     def _cleanupGlobalDeferreds(self):
@@ -413,6 +442,18 @@ class SSHConnection(service.SSHService):
         @type wantReply:    L{bool}
         @rtype:             C{Deferred}/L{None}
         """
+        ledger = _serviceLedgerOf(self)
+        if ledger is not None and ledger.isConnectionServiceStopped(self):
+            # The stop settlement already owns the terminal form of global
+            # requests: they fail with "Connection stopped." rather than
+            # escaping uncalled onto a connection nobody services.
+            if wantReply:
+                d = defer.Deferred()
+                reason = error.ConchError("Connection stopped.")
+                ledger.globalRequestSettled(self, d)
+                d.errback(reason)
+                return d
+            return
         self.transport.sendPacket(
             MSG_GLOBAL_REQUEST,
             common.NS(request) + (wantReply and b"\xff" or b"\x00") + data,
@@ -429,6 +470,19 @@ class SSHConnection(service.SSHService):
         @type channel:  subclass of C{SSHChannel}
         @type extra:    L{bytes}
         """
+        ledger = _serviceLedgerOf(self)
+        if ledger is not None and ledger.isConnectionServiceStopped(self):
+            # A channel an inner sender starts opening after the stop
+            # committed belongs to the still-opening settlement: it is never
+            # put on the wire and immediately receives the same
+            # ConnectionLost openFailed the other opening channels got.
+            channel.conn = self
+            channel.id = self.localChannelID
+            self.localChannelID += 1
+            reason = twisted.internet.error.ConnectionLost()
+            ledger.channelSettledOpenFailed(self, channel, reason)
+            channel.openFailed(reason)
+            return
         self._log.info(
             "opening channel {id} with {localWindowSize} {localMaxPacket}",
             id=self.localChannelID,

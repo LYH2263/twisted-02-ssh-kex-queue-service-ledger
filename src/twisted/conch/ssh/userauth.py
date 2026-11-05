@@ -32,6 +32,16 @@ _ConchPortalTuple = tuple[
 ]
 
 
+def _serviceLedgerOf(authService):
+    """
+    @return: The L{ServiceLedger} installed on the transport of
+        C{authService}, or L{None} when settlement bookkeeping was not
+        enabled.
+    """
+    transport = getattr(authService, "transport", None)
+    return getattr(transport, "serviceLedger", None)
+
+
 class SSHUserAuthServer(service.SSHService):
     """
     A service implementing the server side of the 'ssh-userauth' service.  It
@@ -113,6 +123,9 @@ class SSHUserAuthServer(service.SSHService):
         self._cancelLoginTimeout = self.clock.callLater(
             self.loginTimeout, self.timeoutAuthentication
         )
+        ledger = _serviceLedgerOf(self)
+        if ledger is not None:
+            ledger.loginTimeoutScheduled(self, self._cancelLoginTimeout)
 
     def serviceStopped(self):
         """
@@ -120,7 +133,13 @@ class SSHUserAuthServer(service.SSHService):
         if it's still going.
         """
         if self._cancelLoginTimeout:
-            self._cancelLoginTimeout.cancel()
+            delayedCall = self._cancelLoginTimeout
+            ledger = _serviceLedgerOf(self)
+            # Cancellation and timeout firing are separate, one-way
+            # settlements: a handle whose firing committed first is already
+            # inactive and must not be cancelled retroactively.
+            if ledger is None or ledger.loginTimeoutCancelCommitted(self, delayedCall):
+                delayedCall.cancel()
             self._cancelLoginTimeout = None
 
     def timeoutAuthentication(self):
@@ -128,6 +147,15 @@ class SSHUserAuthServer(service.SSHService):
         Called when the user has timed out on authentication.  Disconnect
         with a DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE message.
         """
+        ledger = _serviceLedgerOf(self)
+        if ledger is not None and not ledger.loginTimeoutFireCommitted(
+            self, self._cancelLoginTimeout
+        ):
+            # The handle was committed to cancellation by an earlier stop
+            # (or already fired): a late, nested timeout must not send a
+            # second disconnect on a cancelled round.
+            self._cancelLoginTimeout = None
+            return
         self._cancelLoginTimeout = None
         self.transport.sendDisconnect(
             transport.DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE, b"you took too long"
